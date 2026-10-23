@@ -1,0 +1,416 @@
+terraform {
+  required_version = ">= 1.5.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+# ---------------------------------------------------------
+# PROVIDERS
+# ---------------------------------------------------------
+
+provider "aws" {
+  alias  = "mumbai"
+  region = "ap-south-1"
+}
+
+provider "aws" {
+  alias  = "singapore"
+  region = "ap-southeast-1"
+}
+
+# ---------------------------------------------------------
+# VARIABLES
+# ---------------------------------------------------------
+
+variable "ssh_public_key" {
+  type        = string
+  description = "Public SSH key for EC2 key pairs"
+}
+
+variable "my_ip_cidr" {
+  type        = string
+  description = "Your workstation public IP CIDR for SSH access (e.g. 203.0.113.25/32)"
+}
+
+# ---------------------------------------------------------
+# DATA SOURCES: UBUNTU 24.04 AMIs
+# ---------------------------------------------------------
+
+data "aws_ami" "ubuntu_mumbai" {
+  provider    = aws.mumbai
+  most_recent = true
+  owners      = ["099720109477"] # Canonical
+
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}
+
+data "aws_ami" "ubuntu_singapore" {
+  provider    = aws.singapore
+  most_recent = true
+  owners      = ["099720109477"] # Canonical
+
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}
+
+# ---------------------------------------------------------
+# SSH KEY PAIRS
+# ---------------------------------------------------------
+
+resource "aws_key_pair" "mumbai_key" {
+  provider   = aws.mumbai
+  key_name   = "mumbai-deployer-key"
+  public_key = var.ssh_public_key
+}
+
+resource "aws_key_pair" "singapore_key" {
+  provider   = aws.singapore
+  key_name   = "singapore-deployer-key"
+  public_key = var.ssh_public_key
+}
+
+# ---------------------------------------------------------
+# MUMBAI INFRASTRUCTURE (ap-south-1)
+# ---------------------------------------------------------
+
+resource "aws_vpc" "mumbai_vpc" {
+  provider             = aws.mumbai
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = {
+    Name = "rushab-Mumbai-VPC"
+  }
+}
+
+resource "aws_subnet" "mumbai_public" {
+  provider                = aws.mumbai
+  vpc_id                  = aws_vpc.mumbai_vpc.id
+  cidr_block              = "10.0.1.0/24"
+  map_public_ip_on_launch = true
+
+  tags = {
+    Name = "Mumbai-Public"
+  }
+}
+
+resource "aws_subnet" "mumbai_private" {
+  provider   = aws.mumbai
+  vpc_id     = aws_vpc.mumbai_vpc.id
+  cidr_block = "10.0.2.0/24"
+
+  tags = {
+    Name = "Mumbai-Private"
+  }
+}
+
+resource "aws_internet_gateway" "mumbai_igw" {
+  provider = aws.mumbai
+  vpc_id   = aws_vpc.mumbai_vpc.id
+
+  tags = {
+    Name = "Mumbai-IGW"
+  }
+}
+
+resource "aws_route_table" "mumbai_public_rt" {
+  provider = aws.mumbai
+  vpc_id   = aws_vpc.mumbai_vpc.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.mumbai_igw.id
+  }
+
+  route {
+    cidr_block                = "10.1.0.0/16"
+    vpc_peering_connection_id = aws_vpc_peering_connection.mumbai_to_singapore.id
+  }
+
+  tags = {
+    Name = "Mumbai-Public-RT"
+  }
+}
+
+resource "aws_route_table_association" "mumbai_public_assoc" {
+  provider       = aws.mumbai
+  subnet_id      = aws_subnet.mumbai_public.id
+  route_table_id = aws_route_table.mumbai_public_rt.id
+}
+
+resource "aws_route_table" "mumbai_private_rt" {
+  provider = aws.mumbai
+  vpc_id   = aws_vpc.mumbai_vpc.id
+
+  route {
+    cidr_block                = "10.1.0.0/16"
+    vpc_peering_connection_id = aws_vpc_peering_connection.mumbai_to_singapore.id
+  }
+
+  tags = {
+    Name = "Mumbai-Private-RT"
+  }
+}
+
+resource "aws_route_table_association" "mumbai_private_assoc" {
+  provider       = aws.mumbai
+  subnet_id      = aws_subnet.mumbai_private.id
+  route_table_id = aws_route_table.mumbai_private_rt.id
+}
+
+resource "aws_security_group" "mumbai_bastion_sg" {
+  provider    = aws.mumbai
+  name        = "mumbai-bastion-sg"
+  description = "Allow inbound SSH from operator and egress"
+  vpc_id      = aws_vpc.mumbai_vpc.id
+
+  ingress {
+    description = "SSH from authorized IP"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = [var.my_ip_cidr]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "mumbai-bastion-sg"
+  }
+}
+
+resource "aws_security_group" "mumbai_private_sg" {
+  provider    = aws.mumbai
+  name        = "mumbai-private-sg"
+  description = "Allow SSH from Mumbai VPC and ICMP from Singapore VPC"
+  vpc_id      = aws_vpc.mumbai_vpc.id
+
+  ingress {
+    description = "SSH from Mumbai public subnet"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = [aws_subnet.mumbai_public.cidr_block]
+  }
+
+  ingress {
+    description = "ICMP from Singapore VPC"
+    from_port   = -1
+    to_port     = -1
+    protocol    = "icmp"
+    cidr_blocks = ["10.1.0.0/16"]
+  }
+
+  ingress {
+    description = "SSH from Singapore VPC"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["10.1.0.0/16"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "mumbai-private-sg"
+  }
+}
+
+resource "aws_instance" "mumbai_bastion" {
+  provider                    = aws.mumbai
+  ami                         = data.aws_ami.ubuntu_mumbai.id
+  instance_type               = "t3.micro"
+  subnet_id                   = aws_subnet.mumbai_public.id
+  key_name                    = aws_key_pair.mumbai_key.key_name
+  vpc_security_group_ids      = [aws_security_group.mumbai_bastion_sg.id]
+  associate_public_ip_address = true
+
+  tags = {
+    Name = "Mumbai-Bastion"
+  }
+}
+
+resource "aws_instance" "mumbai_private_ec2" {
+  provider               = aws.mumbai
+  ami                    = data.aws_ami.ubuntu_mumbai.id
+  instance_type          = "t3.micro"
+  subnet_id              = aws_subnet.mumbai_private.id
+  key_name               = aws_key_pair.mumbai_key.key_name
+  vpc_security_group_ids = [aws_security_group.mumbai_private_sg.id]
+
+  tags = {
+    Name = "Mumbai-Private-EC2"
+  }
+}
+
+# ---------------------------------------------------------
+# SINGAPORE INFRASTRUCTURE (ap-southeast-1)
+# ---------------------------------------------------------
+
+resource "aws_vpc" "singapore_vpc" {
+  provider             = aws.singapore
+  cidr_block           = "10.1.0.0/16"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = {
+    Name = "rushab-Singapore-VPC"
+  }
+}
+
+resource "aws_subnet" "singapore_private" {
+  provider   = aws.singapore
+  vpc_id     = aws_vpc.singapore_vpc.id
+  cidr_block = "10.1.1.0/24"
+
+  tags = {
+    Name = "Singapore-Private"
+  }
+}
+
+resource "aws_route_table" "singapore_private_rt" {
+  provider = aws.singapore
+  vpc_id   = aws_vpc.singapore_vpc.id
+
+  route {
+    cidr_block                = "10.0.0.0/16"
+    vpc_peering_connection_id = aws_vpc_peering_connection.mumbai_to_singapore.id
+  }
+
+  tags = {
+    Name = "Singapore-Private-RT"
+  }
+}
+
+resource "aws_route_table_association" "singapore_private_assoc" {
+  provider       = aws.singapore
+  subnet_id      = aws_subnet.singapore_private.id
+  route_table_id = aws_route_table.singapore_private_rt.id
+}
+
+resource "aws_security_group" "singapore_private_sg" {
+  provider    = aws.singapore
+  name        = "singapore-private-sg"
+  description = "Allow SSH and ICMP from Mumbai VPC"
+  vpc_id      = aws_vpc.singapore_vpc.id
+
+  ingress {
+    description = "SSH from Mumbai VPC"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["10.0.0.0/16"]
+  }
+
+  ingress {
+    description = "ICMP from Mumbai VPC"
+    from_port   = -1
+    to_port     = -1
+    protocol    = "icmp"
+    cidr_blocks = ["10.0.0.0/16"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "singapore-private-sg"
+  }
+}
+
+resource "aws_instance" "singapore_private_ec2" {
+  provider               = aws.singapore
+  ami                    = data.aws_ami.ubuntu_singapore.id
+  instance_type          = "t3.micro"
+  subnet_id              = aws_subnet.singapore_private.id
+  key_name               = aws_key_pair.singapore_key.key_name
+  vpc_security_group_ids = [aws_security_group.singapore_private_sg.id]
+
+  tags = {
+    Name = "Singapore-Private-EC2"
+  }
+}
+
+# ---------------------------------------------------------
+# CROSS-REGION VPC PEERING
+# ---------------------------------------------------------
+
+resource "aws_vpc_peering_connection" "mumbai_to_singapore" {
+  provider    = aws.mumbai
+  vpc_id      = aws_vpc.mumbai_vpc.id
+  peer_vpc_id = aws_vpc.singapore_vpc.id
+  peer_region = "ap-southeast-1"
+  auto_accept = false
+
+  tags = {
+    Name = "Mumbai-Singapore-Peering"
+  }
+}
+
+resource "aws_vpc_peering_connection_accepter" "singapore_peer_accepter" {
+  provider                  = aws.singapore
+  vpc_peering_connection_id = aws_vpc_peering_connection.mumbai_to_singapore.id
+  auto_accept               = true
+
+  tags = {
+    Name = "Mumbai-Singapore-Peering-Accepter"
+  }
+}
+
+# ---------------------------------------------------------
+# OUTPUTS
+# ---------------------------------------------------------
+
+output "bastion_public_ip" {
+  description = "Public IP for SSH bastion host"
+  value       = aws_instance.mumbai_bastion.public_ip
+}
+
+output "mumbai_private_ip" {
+  description = "Private IP of Mumbai EC2"
+  value       = aws_instance.mumbai_private_ec2.private_ip
+}
+
+output "singapore_private_ip" {
+  description = "Private IP of Singapore EC2"
+  value       = aws_instance.singapore_private_ec2.private_ip
+}
+
+output "peering_connection_id" {
+  description = "ID of the Cross-Region VPC Peering Connection"
+  value       = aws_vpc_peering_connection.mumbai_to_singapore.id
+}
